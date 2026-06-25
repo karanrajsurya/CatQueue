@@ -1,0 +1,31 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Job {
+  id             String    @id @default(uuid())
+  jobName        String
+  payload        Json
+  status         Status    @default(PENDING)
+  priority       Int       @default(3)
+  attemptCount   Int       @default(0)
+  maxAttempts    Int       @default(6)
+  runAt          DateTime  @default(now())
+  lockedUntil    DateTime?
+  workerId       String?
+  idempotencyKey String?   @unique
+  errorLog       Json?
+  createdAt      DateTime  @default(now())
+}
+
+enum Status {
+  PENDING
+  PROCESSING
+  COMPLETED
+  DEAD
+}
