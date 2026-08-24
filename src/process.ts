@@ -2,7 +2,6 @@ import { Pool } from "pg";
 import { Handler, Job } from "./types.js";
 import { workerThread } from "./worker.js";
 import {
-  insertDependencyEdges,
   claimRunnableJobs,
   setCompletedJobsToNull,
 } from "./inQueueProcesses.js";
@@ -51,7 +50,6 @@ export const processNextBatch = async (
 
   if (currentBatch.length === 0) return false;
   claimedAny = true;
-  await insertDependencyEdges(pool, currentBatch);
 
   let nextBatchPromise: Promise<Job[]> | null = null;
   let index = 0;
@@ -89,7 +87,6 @@ export const processNextBatch = async (
       nextBatchPromise = null;
 
       if (nextBatch.length > 0) {
-        await insertDependencyEdges(pool, nextBatch);
         currentBatch = nextBatch;
         index = 0;
         continue;

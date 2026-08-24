@@ -2,7 +2,6 @@ import { computeRetryState, updateNewJobs } from "./inQueueProcesses.js";
 import { Handler, Job } from "./types.js";
 import { Pool } from "pg";
 
-// worker.ts — drop the semaphore param and its release() calls entirely
 export const workerThread = async (
   job: Job,
   pool: Pool,
@@ -18,7 +17,7 @@ export const workerThread = async (
       console.warn(
         `[worker] No handler registered for job name: ${job.job_name}. Set to pending untill handler is registered.`,
       );
-      return true;
+      return false;
     }
     await handler(job.payload);
     return true;

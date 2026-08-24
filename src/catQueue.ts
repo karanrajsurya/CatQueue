@@ -14,6 +14,7 @@ import {
   StatsOptions,
   StatsObject,
 } from "./types.js";
+import { insertDependencyEdges } from "./inQueueProcesses.js";
 
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -56,22 +57,14 @@ export class CatQueue {
     this.job_name = "";
   }
 
-  async enqueue<T = any>(
-    jobName: string,
-    payload: T,
-    options: JobOptions = {},
-  ): Promise<string> {
-    let idempotency_key: string = "";
-    if (!options.idempotencyKey) {
-      idempotency_key = `${this.id}-${jobName}-${randomUUID()}`;
-    }
+async enqueue<T = any>(jobName: string, payload: T, options: JobOptions = {}): Promise<string> {
+  const idempotency_key = options.idempotencyKey ?? `${this.id}-${jobName}-${randomUUID()}`;
+  const deps = this.dependencies;
 
+  if (!deps?.length) {
     const { rows } = await this.pool.query(
-      `
-      INSERT INTO catqueue_jobs (job_name, payload, priority, max_attempts, run_at, idempotency_key, dependencies)
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-      RETURNING id
-    `,
+      `INSERT INTO catqueue_jobs (job_name, payload, priority, max_attempts, run_at, idempotency_key, dependencies)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
       [
         jobName,
         JSON.stringify(payload),
@@ -79,38 +72,76 @@ export class CatQueue {
         options.maxAttempts ?? 5,
         options.runAt ?? new Date(),
         idempotency_key,
-        this.dependencies,
+        deps,
       ],
     );
     return rows[0].id;
   }
 
-  async enqueueBatch<T = any>(
-    jobs: { jobName: string; payload: T; options?: JobOptions }[],
-  ): Promise<string[]> {
-    const jobNames = jobs.map((j) => j.jobName);
-    const payloads = jobs.map((j) => JSON.stringify(j.payload));
-    const priorities = jobs.map((j) => j.options?.priority ?? 3);
-    const maxAttempts = jobs.map((j) => j.options?.maxAttempts ?? 5);
-    const runAts = jobs.map((j) => j.options?.runAt ?? new Date());
-    const idempotencyKeys = jobs.map((j) =>
-      j.options?.idempotencyKey
-        ? j.options.idempotencyKey
-        : `${this.id}-${j.jobName}-${randomUUID()}`,
+  const client = await this.pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `INSERT INTO catqueue_jobs (job_name, payload, priority, max_attempts, run_at, idempotency_key, dependencies)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+      [jobName, JSON.stringify(payload), options.priority ?? 3, options.maxAttempts ?? 5,
+       options.runAt ?? new Date(), idempotency_key, this.dependencies],
     );
-
-    const { rows } = await this.pool.query(
-      `
-    INSERT INTO catqueue_jobs (job_name, payload, priority, max_attempts, run_at, idempotency_key)
-    SELECT * FROM UNNEST(
-      $1::text[], $2::jsonb[], $3::int[], $4::int[], $5::timestamptz[], $6::text[]
-    )
-    RETURNING id
-    `,
-      [jobNames, payloads, priorities, maxAttempts, runAts, idempotencyKeys],
-    );
-    return rows.map((r) => r.id);
+    const jobId = rows[0].id;
+    if (this.dependencies?.length) {
+      await insertDependencyEdges(client, [{ id: jobId, dependencies: this.dependencies }]);
+    }
+    await client.query("COMMIT");
+    return jobId;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
   }
+}
+
+async enqueueBatch<T = any>(
+  jobs: { jobName: string; payload: T; options?: JobOptions }[],
+  dependencies?: string[],
+): Promise<string[]> {
+  const jobNames = jobs.map((j) => j.jobName);
+  const payloads = jobs.map((j) => JSON.stringify(j.payload));
+  const priorities = jobs.map((j) => j.options?.priority ?? 3);
+  const maxAttempts = jobs.map((j) => j.options?.maxAttempts ?? 5);
+  const runAts = jobs.map((j) => j.options?.runAt ?? new Date());
+  const idempotencyKeys = jobs.map((j) =>
+    j.options?.idempotencyKey ?? `${this.id}-${j.jobName}-${randomUUID()}`,
+  );
+
+  const insertSql = `
+    INSERT INTO catqueue_jobs (job_name, payload, priority, max_attempts, run_at, idempotency_key, dependencies)
+    SELECT job_name, payload, priority, max_attempts, run_at, idempotency_key, $7::text[]
+    FROM UNNEST($1::text[], $2::jsonb[], $3::int[], $4::int[], $5::timestamptz[], $6::text[])
+      AS t(job_name, payload, priority, max_attempts, run_at, idempotency_key)
+    RETURNING id
+  `;
+  const params = [jobNames, payloads, priorities, maxAttempts, runAts, idempotencyKeys, dependencies ?? null];
+
+  if (!dependencies?.length) {
+    const { rows } = await this.pool.query(insertSql, params);
+    return rows.map((r: any) => r.id);
+  }
+
+  const client = await this.pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(insertSql, params);
+    await insertDependencyEdges(client, rows.map((r: any) => ({ id: r.id, dependencies })));
+    await client.query("COMMIT");
+    return rows.map((r: any) => r.id);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
 
   register<T = any>(jobName: string, handler: Handler<T>): void {
     this.handlers.set(jobName, handler);

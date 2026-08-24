@@ -1,4 +1,4 @@
-import { Pool } from "pg";
+import { Pool, PoolClient } from "pg";
 import { Job } from "./types";
 
 export async function claimRunnableJobs(
@@ -45,7 +45,10 @@ export async function claimRunnableJobs(
   return rows;
 }
 
-export async function insertDependencyEdges(pool: Pool, rows: Job[]) {
+export async function insertDependencyEdges(
+  pool: PoolClient,
+  rows: { id: string; dependencies?: string[] | null }[],
+) {
   const jobIds: string[] = [];
   const depIds: string[] = [];
   for (const job of rows) {
