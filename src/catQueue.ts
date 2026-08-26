@@ -4,7 +4,7 @@ import {
   cronJobHandler,
   deleteStaleIdempotencyKeys,
 } from "./delayedProcesses.js";
-import { processNextJob } from "./process.js";
+import { processNextBatch } from "./process.js";
 import { recoverStuckJobs } from "./delayedProcesses.js";
 import {
   CatQueueConfig,
@@ -14,12 +14,15 @@ import {
   StatsOptions,
   StatsObject,
 } from "./types.js";
+import { insertDependencyEdges } from "./inQueueProcesses.js";
+import { createHash } from "crypto";
 
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 export class CatQueue {
   private pool: Pool;
+  private isExternalPool: boolean = false;
   private id: string;
   private job_name: string;
   private handlers: Map<string, Handler> = new Map();
@@ -32,31 +35,45 @@ export class CatQueue {
   private maxAttempts: number;
   private cron?: ReturnType<typeof cronJobHandler>;
   private dependencies?: string[];
+  private maxPoolSize?: number;
 
   constructor(config: CatQueueConfig) {
-    this.pool = new Pool({ connectionString: config.connectionString });
+    this.maxPoolSize = config.maxPoolSize;
+    if (config.pool) {
+      this.pool = config.pool;
+      this.isExternalPool = true;
+    } else {
+      this.pool = new Pool({
+        connectionString: config.connectionString,
+        max: this.maxPoolSize ?? 20,
+      });
+    }
     this.pollInterval = config.pollInterval ?? 1000;
     this.lockDuration = config.lockDuration ?? 30;
-    this.batchSize = config.batchSize ?? 50;
+    const n = Number(config.batchSize ?? 50);
+    this.batchSize = Number.isInteger(n) ? Math.max(1, n) : 50;
     this.maxAttempts = config.maxAttempts ?? 5;
     this.dependencies = config.dependencies ?? [];
     this.id = randomUUID();
     this.job_name = "";
   }
 
-  async enqueue<T = any>(
-    jobName: string,
-    payload: T,
-    options: JobOptions = {},
-  ): Promise<string> {
-    const idempotency_key: string = `${this.id}-${jobName}-${randomUUID()}`;
+private defaultIdempotencyKey(jobName: string, payload: unknown): string {
+  const payloadHash = createHash("sha256")
+    .update(JSON.stringify(payload))
+    .digest("hex")
+    .slice(0, 16); // short enough to stay cheap to index/compare
+  return `${jobName}:${payloadHash}`;
+}
 
+async enqueue<T = any>(jobName: string, payload: T, options: JobOptions = {}): Promise<string> {
+  const idempotency_key = options.idempotencyKey ?? this.defaultIdempotencyKey(jobName, payload);
+  const deps = this.dependencies;
+
+  if (!deps?.length) {
     const { rows } = await this.pool.query(
-      `
-      INSERT INTO catqueue_jobs (job_name, payload, priority, max_attempts, run_at, idempotency_key)
-      VALUES ($1, $2, $3, $4, $5, $6)
-      RETURNING id
-    `,
+      `INSERT INTO catqueue_jobs (job_name, payload, priority, max_attempts, run_at, idempotency_key, dependencies)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
       [
         jobName,
         JSON.stringify(payload),
@@ -64,33 +81,76 @@ export class CatQueue {
         options.maxAttempts ?? 5,
         options.runAt ?? new Date(),
         idempotency_key,
+        deps,
       ],
     );
     return rows[0].id;
   }
 
-  async enqueueBatch<T = any>(
-    jobs: { jobName: string; payload: T; options?: JobOptions }[],
-  ): Promise<string[]> {
-    const jobNames = jobs.map((j) => j.jobName);
-    const payloads = jobs.map((j) => JSON.stringify(j.payload));
-    const priorities = jobs.map((j) => j.options?.priority ?? 3);
-    const maxAttempts = jobs.map((j) => j.options?.maxAttempts ?? 5);
-    const runAts = jobs.map((j) => j.options?.runAt ?? new Date());
-    const idempotencyKeys = jobs.map((j) => j.options?.idempotencyKey ?? null);
-
-    const { rows } = await this.pool.query(
-      `
-    INSERT INTO catqueue_jobs (job_name, payload, priority, max_attempts, run_at, idempotency_key)
-    SELECT * FROM UNNEST(
-      $1::text[], $2::jsonb[], $3::int[], $4::int[], $5::timestamptz[], $6::text[]
-    )
-    RETURNING id
-    `,
-      [jobNames, payloads, priorities, maxAttempts, runAts, idempotencyKeys],
+  const client = await this.pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(
+      `INSERT INTO catqueue_jobs (job_name, payload, priority, max_attempts, run_at, idempotency_key, dependencies)
+       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+      [jobName, JSON.stringify(payload), options.priority ?? 3, options.maxAttempts ?? 5,
+       options.runAt ?? new Date(), idempotency_key, this.dependencies],
     );
-    return rows.map((r) => r.id);
+    const jobId = rows[0].id;
+    if (this.dependencies?.length) {
+      await insertDependencyEdges(client, [{ id: jobId, dependencies: this.dependencies }]);
+    }
+    await client.query("COMMIT");
+    return jobId;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
   }
+}
+
+async enqueueBatch<T = any>(
+  jobs: { jobName: string; payload: T; options?: JobOptions }[],
+  dependencies?: string[],
+): Promise<string[]> {
+  const jobNames = jobs.map((j) => j.jobName);
+  const payloads = jobs.map((j) => JSON.stringify(j.payload));
+  const priorities = jobs.map((j) => j.options?.priority ?? 3);
+  const maxAttempts = jobs.map((j) => j.options?.maxAttempts ?? 5);
+  const runAts = jobs.map((j) => j.options?.runAt ?? new Date());
+  const idempotencyKeys = jobs.map((j) =>
+    j.options?.idempotencyKey ?? this.defaultIdempotencyKey(j.jobName, j.payload),
+  );
+
+  const insertSql = `
+    INSERT INTO catqueue_jobs (job_name, payload, priority, max_attempts, run_at, idempotency_key, dependencies)
+    SELECT job_name, payload, priority, max_attempts, run_at, idempotency_key, $7::text[]
+    FROM UNNEST($1::text[], $2::jsonb[], $3::int[], $4::int[], $5::timestamptz[], $6::text[])
+      AS t(job_name, payload, priority, max_attempts, run_at, idempotency_key)
+    RETURNING id
+  `;
+  const params = [jobNames, payloads, priorities, maxAttempts, runAts, idempotencyKeys, dependencies ?? null];
+
+  if (!dependencies?.length) {
+    const { rows } = await this.pool.query(insertSql, params);
+    return rows.map((r: any) => r.id);
+  }
+
+  const client = await this.pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query(insertSql, params);
+    await insertDependencyEdges(client, rows.map((r: any) => ({ id: r.id, dependencies })));
+    await client.query("COMMIT");
+    return rows.map((r: any) => r.id);
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
 
   register<T = any>(jobName: string, handler: Handler<T>): void {
     this.handlers.set(jobName, handler);
@@ -101,10 +161,6 @@ export class CatQueue {
     this.running = true;
 
     this.cron = cronJobHandler(this.pool);
-
-    console.log(
-      `[catqueue] Worker ${this.workerId} started, polling every ${this.pollInterval}ms`,
-    );
 
     this.workerPromise = (async () => {
       const recoveryInterval = setInterval(() => {
@@ -120,7 +176,7 @@ export class CatQueue {
           let didWork = false;
 
           while (
-            await processNextJob(
+            await processNextBatch(
               this.pool,
               this.handlers,
               this.workerId,
@@ -155,7 +211,9 @@ export class CatQueue {
       await this.workerPromise;
     }
 
-    await this.pool.end();
+    if (!this.isExternalPool) {
+      await this.pool.end();
+    }
   }
 }
 
