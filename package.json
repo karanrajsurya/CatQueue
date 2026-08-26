@@ -37,7 +37,7 @@
   "homepage": "https://github.com/karanrajsurya/CatQueue_npm_package#readme",
   "dependencies": {
     "cron": "^4.4.0",
-    "pg": ">=8.0.0",
+    "pg": "^8.23.0",
     "vitest": "^4.1.10"
   },
   "devDependencies": {
@@ -45,8 +45,5 @@
     "@types/pg": "^8.20.0",
     "node-pg-migrate": "^9.0.0",
     "typescript": "^7.0.2"
-  },
-  "peerDependencies": {
-    "pg": ">=8.0.0"
   }
 }
