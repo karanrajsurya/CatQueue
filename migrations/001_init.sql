@@ -24,6 +24,6 @@ CREATE TABLE IF NOT EXISTS job_dependencies (
   depends_on UUID NOT NULL REFERENCES catqueue_jobs(id)
 );
 
-CREATE INDEX idx_catqueue_claim ON catqueue_jobs (job_name, priority ASC, created_at ASC) WHERE status = 'PENDING';
+CREATE INDEX IF NOT EXISTS idx_catqueue_claim ON catqueue_jobs (job_name, priority ASC, created_at ASC) WHERE status = 'PENDING';
 CREATE INDEX IF NOT EXISTS idx_job_deps_job_id ON job_dependencies (job_id);
 CREATE INDEX IF NOT EXISTS idx_job_deps_depends_on ON job_dependencies (depends_on);

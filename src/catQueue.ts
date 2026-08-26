@@ -15,6 +15,7 @@ import {
   StatsObject,
 } from "./types.js";
 import { insertDependencyEdges } from "./inQueueProcesses.js";
+import { createHash } from "crypto";
 
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -57,8 +58,16 @@ export class CatQueue {
     this.job_name = "";
   }
 
+private defaultIdempotencyKey(jobName: string, payload: unknown): string {
+  const payloadHash = createHash("sha256")
+    .update(JSON.stringify(payload))
+    .digest("hex")
+    .slice(0, 16); // short enough to stay cheap to index/compare
+  return `${jobName}:${payloadHash}`;
+}
+
 async enqueue<T = any>(jobName: string, payload: T, options: JobOptions = {}): Promise<string> {
-  const idempotency_key = options.idempotencyKey ?? `${this.id}-${jobName}-${randomUUID()}`;
+  const idempotency_key = options.idempotencyKey ?? this.defaultIdempotencyKey(jobName, payload);
   const deps = this.dependencies;
 
   if (!deps?.length) {
@@ -111,7 +120,7 @@ async enqueueBatch<T = any>(
   const maxAttempts = jobs.map((j) => j.options?.maxAttempts ?? 5);
   const runAts = jobs.map((j) => j.options?.runAt ?? new Date());
   const idempotencyKeys = jobs.map((j) =>
-    j.options?.idempotencyKey ?? `${this.id}-${j.jobName}-${randomUUID()}`,
+    j.options?.idempotencyKey ?? this.defaultIdempotencyKey(j.jobName, j.payload),
   );
 
   const insertSql = `

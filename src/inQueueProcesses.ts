@@ -11,7 +11,6 @@ export async function claimRunnableJobs(
   if (limit <= 0) return [];
 
   const { rows } = await pool.query<Job>(
-    //check this query
     `
     WITH target_jobs AS (
       SELECT c.id FROM catqueue_jobs c
@@ -119,7 +118,8 @@ export async function updateNewJobs(
         run_at = $3,
         locked_until = NULL,
         worker_id = NULL,
-        error_log = $4
+        error_log = $4,
+       idempotency_key = CASE WHEN $1 = 'DEAD' THEN NULL ELSE idempotency_key END
       WHERE id = $5
     `,
     [status, nextAttempt, newRunAt, newErrorLog, jobId],
