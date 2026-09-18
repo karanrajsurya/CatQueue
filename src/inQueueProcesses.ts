@@ -10,42 +10,41 @@ export async function claimRunnableJobs(
 ): Promise<Job[]> {
   if (limit <= 0) return [];
 
-  const { rows } = await pool.query<Job>(
-    `
-    WITH target_jobs AS (
-      SELECT c.id FROM catqueue_jobs c
-      WHERE c.status = 'PENDING'
-        AND c.run_at <= NOW()
-        AND c.job_name = ANY($3::text[])
-        AND (
-          c.dependencies IS NULL
-          OR cardinality(c.dependencies) = 0
-          OR NOT EXISTS (
-            SELECT 1 FROM job_dependencies jd
+  const { rows } = await pool.query<Job>({
+    text: `
+      WITH target_jobs AS (
+        SELECT cj.id
+        FROM catqueue_jobs cj
+        WHERE cj.status = 'PENDING'
+          AND cj.run_at <= NOW()
+          AND cj.job_name = ANY($3::text[])
+          AND NOT EXISTS (
+            SELECT 1
+            FROM job_dependencies jd
             JOIN catqueue_jobs dep ON dep.id = jd.depends_on
-            WHERE jd.job_id = c.id AND dep.status <> 'COMPLETED'
+            WHERE jd.job_id = cj.id
+              AND dep.status != 'COMPLETED'
           )
-        )
-      ORDER BY c.priority ASC, c.created_at ASC
-      LIMIT $4
-      FOR UPDATE SKIP LOCKED
-    )
-    UPDATE catqueue_jobs cj
-    SET worker_id = $1,
-        status = 'PROCESSING',
-        locked_until = NOW() + ($2 * INTERVAL '1 second')
-    FROM target_jobs t
-    WHERE cj.id = t.id
-    RETURNING cj.*;
+        ORDER BY cj.priority ASC, cj.created_at ASC
+        LIMIT $4
+        FOR UPDATE SKIP LOCKED
+      )
+      UPDATE catqueue_jobs cj
+      SET worker_id = $1,
+          status = 'PROCESSING',
+          locked_until = NOW() + ($2 * INTERVAL '1 second')
+      FROM target_jobs t
+      WHERE cj.id = t.id
+      RETURNING cj.*;
     `,
-    [workerId, lockDuration, jobNames, limit],
-  );
+    values: [workerId, lockDuration, jobNames, limit],
+  });
 
   return rows;
 }
 
 export async function insertDependencyEdges(
-  pool: PoolClient,
+  pool: Pick<PoolClient, "query">,
   rows: { id: string; dependencies?: string[] | null }[],
 ) {
   const jobIds: string[] = [];
@@ -88,16 +87,7 @@ export async function setCompletedJobsToNull(
   completedIds: string[],
 ) {
   return await pool.query(
-    `
-      UPDATE catqueue_jobs
-      SET
-        status = 'COMPLETED',
-        locked_until = NULL,
-        worker_id = NULL,
-        completed_at = Now(),
-        idempotency_key = NULL
-      WHERE id = ANY($1::uuid[])
-    `,
+    `DELETE FROM catqueue_jobs WHERE id = ANY($1::uuid[])`,
     [completedIds],
   );
 }

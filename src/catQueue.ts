@@ -1,11 +1,12 @@
 import { Pool } from "pg";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import {
   cronJobHandler,
   deleteStaleIdempotencyKeys,
+  flushCoalesced,
+  recoverStuckJobs,
 } from "./delayedProcesses.js";
 import { processNextBatch } from "./process.js";
-import { recoverStuckJobs } from "./delayedProcesses.js";
 import {
   CatQueueConfig,
   Handler,
@@ -13,12 +14,17 @@ import {
   Job,
   StatsOptions,
   StatsObject,
+  PendingEntry,
 } from "./types.js";
 import { insertDependencyEdges } from "./inQueueProcesses.js";
-import { createHash } from "crypto";
 
 const sleep = (ms: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+export interface EnqueueHandle {
+  idempotencyKey: string;
+  id: Promise<string>; // resolves once the job is saved to Postgres
+}
 
 export class CatQueue {
   private pool: Pool;
@@ -32,163 +38,284 @@ export class CatQueue {
   private pollInterval: number;
   private lockDuration: number;
   private batchSize: number;
+  private concurrency: number;
   private maxAttempts: number;
   private cron?: ReturnType<typeof cronJobHandler>;
   private dependencies?: string[];
   private maxPoolSize?: number;
+  private maxRequests: number;
+  private inFlightRequests: Map<string, PendingEntry> = new Map();
+  private activeFlushTimer: NodeJS.Timeout | null = null;
+  private flushDelayMs: number;
+  private pendingFlushes: Map<string, PendingEntry> = new Map();
+
+  private flushSignal: { promise: Promise<void>; resolve: () => void } =
+    this.createSignal();
 
   constructor(config: CatQueueConfig) {
-    this.maxPoolSize = config.maxPoolSize;
+    this.concurrency = config.concurrency ?? 30;
+    this.maxPoolSize = config.maxPoolSize ?? (this.concurrency + 10);
     if (config.pool) {
       this.pool = config.pool;
       this.isExternalPool = true;
     } else {
       this.pool = new Pool({
         connectionString: config.connectionString,
-        max: this.maxPoolSize ?? 20,
+        max: this.maxPoolSize,
+        connectionTimeoutMillis: 10000,
+        idleTimeoutMillis: 10000,
+        keepAlive: true,
       });
     }
-    this.pollInterval = config.pollInterval ?? 1000;
+    this.pollInterval = config.pollInterval ?? 10;
     this.lockDuration = config.lockDuration ?? 30;
-    const n = Number(config.batchSize ?? 50);
-    this.batchSize = Number.isInteger(n) ? Math.max(1, n) : 50;
+    const n = Number(config.batchSize ?? 500);
+    this.batchSize = Number.isInteger(n) ? Math.max(1, n) : 500;
     this.maxAttempts = config.maxAttempts ?? 5;
     this.dependencies = config.dependencies ?? [];
     this.id = randomUUID();
     this.job_name = "";
+    this.maxRequests = this.batchSize;
+    this.flushDelayMs = 16;
   }
 
-private defaultIdempotencyKey(jobName: string, payload: unknown): string {
-  const payloadHash = createHash("sha256")
-    .update(JSON.stringify(payload))
-    .digest("hex")
-    .slice(0, 16); // short enough to stay cheap to index/compare
-  return `${jobName}:${payloadHash}`;
-}
-
-async enqueue<T = any>(jobName: string, payload: T, options: JobOptions = {}): Promise<string> {
-  const idempotency_key = options.idempotencyKey ?? this.defaultIdempotencyKey(jobName, payload);
-  const deps = this.dependencies;
-
-  if (!deps?.length) {
-    const { rows } = await this.pool.query(
-      `INSERT INTO catqueue_jobs (job_name, payload, priority, max_attempts, run_at, idempotency_key, dependencies)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
-      [
-        jobName,
-        JSON.stringify(payload),
-        options.priority ?? 3,
-        options.maxAttempts ?? 5,
-        options.runAt ?? new Date(),
-        idempotency_key,
-        deps,
-      ],
-    );
-    return rows[0].id;
+  private createSignal(): { promise: Promise<void>; resolve: () => void } {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => (resolve = r));
+    return { promise, resolve };
   }
 
-  const client = await this.pool.connect();
-  try {
-    await client.query("BEGIN");
-    const { rows } = await client.query(
-      `INSERT INTO catqueue_jobs (job_name, payload, priority, max_attempts, run_at, idempotency_key, dependencies)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
-      [jobName, JSON.stringify(payload), options.priority ?? 3, options.maxAttempts ?? 5,
-       options.runAt ?? new Date(), idempotency_key, this.dependencies],
-    );
-    const jobId = rows[0].id;
-    if (this.dependencies?.length) {
-      await insertDependencyEdges(client, [{ id: jobId, dependencies: this.dependencies }]);
+  private notifyFlush(): void {
+    const prev = this.flushSignal;
+    this.flushSignal = this.createSignal();
+    prev.resolve();
+  }
+
+  defaultIdempotencyKey(jobName: string, payload: unknown) {
+    const payloadHash = createHash("sha256")
+      .update(JSON.stringify(payload))
+      .digest("hex")
+      .slice(0, 16);
+    return `${jobName}:${payloadHash}`;
+  }
+
+  private triggerFlush(force = false): void {
+  if (this.activeFlushTimer) {
+    if (force) {
+      clearTimeout(this.activeFlushTimer);
+      this.activeFlushTimer = null;
+    } else {
+      return;
     }
-    await client.query("COMMIT");
-    return jobId;
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
   }
+
+  const delay = force ? 0 : this.flushDelayMs;
+  this.activeFlushTimer = setTimeout(() => {
+    this.activeFlushTimer = null;
+    void flushCoalesced(this.pool, this.inFlightRequests, this.pendingFlushes).finally(() => {
+      this.notifyFlush();
+    });
+  }, delay);
 }
 
-async enqueueBatch<T = any>(
-  jobs: { jobName: string; payload: T; options?: JobOptions }[],
-  dependencies?: string[],
-): Promise<string[]> {
-  const jobNames = jobs.map((j) => j.jobName);
-  const payloads = jobs.map((j) => JSON.stringify(j.payload));
-  const priorities = jobs.map((j) => j.options?.priority ?? 3);
-  const maxAttempts = jobs.map((j) => j.options?.maxAttempts ?? 5);
-  const runAts = jobs.map((j) => j.options?.runAt ?? new Date());
-  const idempotencyKeys = jobs.map((j) =>
-    j.options?.idempotencyKey ?? this.defaultIdempotencyKey(j.jobName, j.payload),
-  );
-
-  const insertSql = `
-    INSERT INTO catqueue_jobs (job_name, payload, priority, max_attempts, run_at, idempotency_key, dependencies)
-    SELECT job_name, payload, priority, max_attempts, run_at, idempotency_key, $7::text[]
-    FROM UNNEST($1::text[], $2::jsonb[], $3::int[], $4::int[], $5::timestamptz[], $6::text[])
-      AS t(job_name, payload, priority, max_attempts, run_at, idempotency_key)
-    RETURNING id
-  `;
-  const params = [jobNames, payloads, priorities, maxAttempts, runAts, idempotencyKeys, dependencies ?? null];
-
-  if (!dependencies?.length) {
-    const { rows } = await this.pool.query(insertSql, params);
-    return rows.map((r: any) => r.id);
+  async enqueue<T = any>(
+  jobName: string,
+  payload: T,
+  options: JobOptions = {},
+): Promise<EnqueueHandle> {
+  if (!this.running) {
+    throw new Error("Cannot enqueue jobs when the queue is stopped.");
   }
 
-  const client = await this.pool.connect();
-  try {
-    await client.query("BEGIN");
-    const { rows } = await client.query(insertSql, params);
-    await insertDependencyEdges(client, rows.map((r: any) => ({ id: r.id, dependencies })));
-    await client.query("COMMIT");
-    return rows.map((r: any) => r.id);
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
+  const dependencyList = options.dependencies ?? this.dependencies ?? [];
+  const key =
+    options.idempotencyKey ?? this.defaultIdempotencyKey(jobName, payload);
+
+  // Coalesce against a key's full lifecycle: buffered OR actively
+  // flushing. Checked before backpressure - a duplicate that's just
+  // going to attach to an existing promise shouldn't have to wait on
+  // buffer space it doesn't need.
+  const existing = this.inFlightRequests.get(key) ?? this.pendingFlushes.get(key);
+  if (existing) return { idempotencyKey: key, id: existing.promise };
+
+  while (this.inFlightRequests.size >= this.maxRequests) {
+    this.triggerFlush(true);
+    await this.flushSignal.promise;
+
+    // The key may have appeared in either map while this call was
+    // parked on the signal - re-check before assuming it's still new.
+    const afterWait = this.inFlightRequests.get(key) ?? this.pendingFlushes.get(key);
+    if (afterWait) return { idempotencyKey: key, id: afterWait.promise };
   }
+
+  let resolveFn!: (id: string) => void;
+  let rejectFn!: (e: unknown) => void;
+  const promise = new Promise<string>((resolve, reject) => {
+    resolveFn = resolve;
+    rejectFn = reject;
+  });
+
+  this.inFlightRequests.set(key, {
+    jobName,
+    payload,
+    options: { ...options, dependencies: dependencyList },
+    promise,
+    resolve: resolveFn,
+    reject: rejectFn,
+  });
+
+  if (this.inFlightRequests.size >= this.maxRequests) {
+    this.triggerFlush(true);
+  } else if (!this.activeFlushTimer) {
+    this.triggerFlush();
+  }
+
+  return { idempotencyKey: key, id: promise };
 }
+
+  async enqueueBatch<T = any>(
+    jobs: {
+      jobName: string;
+      payload: T;
+      options?: JobOptions;
+      dependencies?: string[];
+    }[],
+    dependencies?: string[],
+  ): Promise<(string | undefined)[]> {
+    if (this.running === false) {
+      throw new Error("Cannot enqueue jobs when the queue is stopped.");
+    }
+
+    const normalizedDependencies = jobs.map((job) =>
+      JSON.stringify(
+        job.options?.dependencies ??
+          job.dependencies ??
+          dependencies ??
+          this.dependencies ??
+          [],
+      ),
+    );
+    const jobNames = jobs.map((j) => j.jobName);
+    const payloads = jobs.map((j) => JSON.stringify(j.payload));
+    const priorities = jobs.map((j) => j.options?.priority ?? 3);
+    const maxAttempts = jobs.map((j) => j.options?.maxAttempts ?? 5);
+    const runAts = jobs.map((j) => j.options?.runAt ?? new Date());
+    const idempotencyKeys = jobs.map(
+      (j) => j.options?.idempotencyKey ?? this.defaultIdempotencyKey(j.jobName, j.payload),
+    );
+
+    const insertJobs = `
+      INSERT INTO catqueue_jobs (job_name, payload, priority, max_attempts, run_at, idempotency_key, dependencies)
+      SELECT job_name, payload, priority, max_attempts, run_at, idempotency_key,
+             ARRAY(SELECT jsonb_array_elements_text(dependencies))
+      FROM UNNEST(
+        $1::text[],
+        $2::jsonb[],
+        $3::int[],
+        $4::int[],
+        $5::timestamptz[],
+        $6::text[],
+        $7::jsonb[]
+      ) AS t(job_name, payload, priority, max_attempts, run_at, idempotency_key, dependencies)
+      ON CONFLICT (idempotency_key) DO NOTHING
+      RETURNING id, idempotency_key, dependencies
+    `;
+    const params = [
+      jobNames,
+      payloads,
+      priorities,
+      maxAttempts,
+      runAts,
+      idempotencyKeys,
+      normalizedDependencies,
+    ];
+
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const { rows } = await client.query(insertJobs, params);
+
+      const idByKey = new Map<string, { id: string; dependencies: string[] }>(
+        rows.map((r: any) => [
+          r.idempotency_key,
+          {
+            id: r.id,
+            dependencies: Array.isArray(r.dependencies) ? r.dependencies : [],
+          },
+        ]),
+      );
+
+      // Keys that hit ON CONFLICT DO NOTHING weren't returned above —
+      // resolve them against existing rows instead of leaving them undefined.
+      const missingKeys = idempotencyKeys.filter((k) => !idByKey.has(k));
+      if (missingKeys.length > 0) {
+        const { rows: existing } = await client.query(
+          `SELECT id, idempotency_key FROM catqueue_jobs WHERE idempotency_key = ANY($1::text[])`,
+          [missingKeys],
+        );
+        for (const r of existing) {
+          idByKey.set(r.idempotency_key, { id: r.id, dependencies: [] });
+        }
+      }
+
+      const insertedRows = rows
+        .filter((r: any) => Array.isArray(r.dependencies) && r.dependencies.length > 0)
+        .map((r: any) => ({ id: r.id, dependencies: r.dependencies }));
+      if (insertedRows.length > 0) {
+        await insertDependencyEdges(client, insertedRows);
+      }
+
+      await client.query("COMMIT");
+
+      // Return ids in the SAME order as the input `jobs` array —
+      // do not rely on undefined row-ordering from INSERT ... SELECT ... UNNEST.
+      return idempotencyKeys.map((key) => idByKey.get(key)?.id);
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
 
   register<T = any>(jobName: string, handler: Handler<T>): void {
     this.handlers.set(jobName, handler);
   }
 
-  start(): void {
-    if (this.running) return;
-    this.running = true;
-
+  private runWorkerLoop(): Promise<void> {
     this.cron = cronJobHandler(this.pool);
 
-    this.workerPromise = (async () => {
+    return (async () => {
       const recoveryInterval = setInterval(() => {
-        recoverStuckJobs(this.pool).catch(console.error);
+        recoverStuckJobs(this.pool).catch(() => {});
       }, 20000);
 
       const staleIdempotencyKeys = setInterval(() => {
-        deleteStaleIdempotencyKeys(this.pool).catch(console.error);
+        deleteStaleIdempotencyKeys(this.pool).catch(() => {});
       }, 3000);
 
       try {
         while (this.running) {
-          let didWork = false;
+          try {
+            let didWork = false;
 
-          while (
-            await processNextBatch(
-              this.pool,
-              this.handlers,
-              this.workerId,
-              this.lockDuration,
-              this.batchSize,
-            )
-          ) {
-            didWork = true;
-          }
+            while (
+              await processNextBatch(
+                this.pool,
+                this.handlers,
+                this.workerId,
+                this.lockDuration,
+                this.concurrency,
+              )
+            ) {
+              didWork = true;
+            }
 
-          if (!didWork) {
-            await sleep(this.pollInterval);
+            if (!didWork) {
+              await sleep(this.pollInterval);
+            }
+          } catch (err) {
+            await sleep(200);
           }
         }
       } finally {
@@ -198,14 +325,36 @@ async enqueueBatch<T = any>(
     })();
   }
 
-  stats(): StatsQuery {
-    return new StatsQuery(this.pool);
+  start(): void {
+    if (this.running) return;
+    this.running = true;
+    this.workerPromise = this.runWorkerLoop();
   }
+
+  async drain(): Promise<void> {
+  while (
+    this.inFlightRequests.size > 0 ||
+    this.pendingFlushes.size > 0 ||
+    this.activeFlushTimer
+  ) {
+    this.triggerFlush(true);
+    const pending = [
+      ...Array.from(this.inFlightRequests.values()),
+      ...Array.from(this.pendingFlushes.values()),
+    ].map((e) => e.promise);
+    if (pending.length > 0) {
+      await Promise.allSettled(pending);
+    } else {
+      await sleep(1);
+    }
+  }
+}
 
   async stop(): Promise<void> {
     this.running = false;
-
     this.cron?.stop();
+
+    await this.drain();
 
     if (this.workerPromise) {
       await this.workerPromise;
@@ -214,6 +363,21 @@ async enqueueBatch<T = any>(
     if (!this.isExternalPool) {
       await this.pool.end();
     }
+  }
+
+  stats(): StatsQuery {
+    return new StatsQuery(this.pool);
+  }
+
+  pause(): void {
+    this.running = false;
+    this.cron?.stop();
+  }
+
+  resume(): void {
+    if (this.running) return;
+    this.running = true;
+    this.workerPromise = this.runWorkerLoop();
   }
 }
 

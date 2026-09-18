@@ -2,6 +2,20 @@ import { Pool } from "pg";
 
 export type Handler<T = any> = (payload: T) => Promise<void>;
 
+export type PendingEntry = {
+  jobName: string;
+  payload: unknown;
+  options: JobOptions;
+  promise: Promise<string>;
+  resolve: (id: string) => void;
+  reject: (e: unknown) => void;
+};
+
+export interface EnqueueHandle {
+  idempotencyKey: string;
+  id: Promise<string>; // resolves once the job is actually persisted
+}
+
 export interface Edge {
   id: string;
   depends_on: string;
@@ -22,6 +36,7 @@ export interface JobOptions {
   maxAttempts?: number;
   runAt?: Date;
   idempotencyKey?: string;
+  dependencies?: string[];
 }
 
 export interface CatQueueConfig {
@@ -33,6 +48,7 @@ export interface CatQueueConfig {
   dependencies?: string[];
   maxPoolSize: number;
   pool?: Pool;
+  concurrency?: number;
 }
 
 export interface Job {
