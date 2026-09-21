@@ -5,15 +5,15 @@ export async function GraphProcess(pool: Pool, claimedIds: string[]) {
   const result_jobIds = await pool.query(
     `
     WITH RECURSIVE deps AS (
-      SELECT jd.id, jd.depends_on
+      SELECT jd.job_id AS id, jd.depends_on
       FROM job_dependencies jd
-      WHERE jd.id = ANY($1)
+      WHERE jd.job_id = ANY($1)
 
       UNION
 
-      SELECT jd.id, jd.depends_on
+      SELECT jd.job_id AS id, jd.depends_on
       FROM job_dependencies jd
-      JOIN deps d ON jd.id = d.depends_on
+      JOIN deps d ON jd.job_id = d.depends_on
     )
     SELECT DISTINCT jd.id, jd.depends_on, c.status
     FROM deps jd
@@ -30,9 +30,9 @@ export async function GraphProcess(pool: Pool, claimedIds: string[]) {
 
   const result_edges = await pool.query<Edge>(
     `
-    SELECT jd.id, jd.depends_on
+    SELECT jd.job_id AS id, jd.depends_on
     FROM job_dependencies jd
-    WHERE jd.id = ANY($1)
+    WHERE jd.job_id = ANY($1)
     AND jd.depends_on = ANY($1)
   `,
     [jobIds],
@@ -40,10 +40,10 @@ export async function GraphProcess(pool: Pool, claimedIds: string[]) {
 
   const result_blocked = await pool.query<{ id: string }>(
     `
-    SELECT DISTINCT jd.id
+    SELECT DISTINCT jd.job_id AS id
     FROM job_dependencies jd
     JOIN catqueue_jobs dep ON dep.id = jd.depends_on
-    WHERE jd.id = ANY($1)
+    WHERE jd.job_id = ANY($1)
     AND dep.status != 'COMPLETED'
     AND jd.depends_on != ALL($1)
   `,
