@@ -103,13 +103,13 @@ export async function updateNewJobs(
   return await pool.query(
     `
       UPDATE catqueue_jobs SET
-        status = $1,
+        status = $1::catqueue_status,
         attempt_count = $2,
         run_at = $3,
         locked_until = NULL,
         worker_id = NULL,
         error_log = $4,
-       idempotency_key = CASE WHEN $1 = 'DEAD' THEN NULL ELSE idempotency_key END
+        idempotency_key = CASE WHEN $1::catqueue_status = 'DEAD' THEN NULL ELSE idempotency_key END
       WHERE id = $5
     `,
     [status, nextAttempt, newRunAt, newErrorLog, jobId],
